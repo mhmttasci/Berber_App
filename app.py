@@ -1,351 +1,482 @@
-from flask import Flask, render_template, request, redirect, url_for, session, make_response, flash, send_file
+from flask import Flask, render_template, request,jsonify, redirect, url_for, flash, session, Response
 from flask_sqlalchemy import SQLAlchemy
-from flask_login import LoginManager, login_user, login_required, logout_user, current_user, UserMixin
-from flask_bcrypt import Bcrypt
-from datetime import datetime, timedelta
-import uuid
-import csv
-from config import Config
-from io import BytesIO
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from sqlalchemy import or_, and_
-from flask import jsonify
 from datetime import datetime, timedelta, time as dtime
-
+import pandas as pd
+from fpdf import FPDF
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase import pdfmetrics
 import os
 FONT_PATH = os.path.join(os.path.dirname(__file__), 'fonts', 'arial.ttf')
 pdfmetrics.registerFont(TTFont('arial', FONT_PATH))
 
 app = Flask(__name__)
-app.config.from_object(Config)
+app.config['SECRET_KEY'] = 'supersecretkey'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///berber.db'
 db = SQLAlchemy(app)
-bcrypt = Bcrypt(app)
 
-login_manager = LoginManager(app)
-login_manager.login_view = 'login'
+@app.template_filter('todatetime')
+def todatetime_filter(s):
+    # Eğer None gelirse veya boşsa None dönsün
+    if not s:
+        return None
+    return datetime.strptime(s, "%d.%m.%Y")
 
-# MODELLER
-class User(db.Model, UserMixin):
+### MODELLER
+
+from werkzeug.security import generate_password_hash, check_password_hash
+
+
+
+class Admin(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True)
+    password_hash = db.Column(db.String(256))
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+class Person(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    emekli_no = db.Column(db.String(20), unique=True, nullable=False)
     name = db.Column(db.String(100), nullable=False)
-    username = db.Column(db.String(80), unique=True, nullable=False)  # Yeni alan
-    password = db.Column(db.String(200), nullable=False)
-    appointments = db.relationship('Appointment', backref='user', lazy=True)
 
 class Chair(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(20), unique=True, nullable=False)
+    name = db.Column(db.String(30), unique=True, nullable=False)
 
 class Timeslot(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     time = db.Column(db.String(5), unique=True, nullable=False)
 
+class VipTimeslot(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    day_of_week = db.Column(db.String(10))  # e.g. 'Cuma'
+    time = db.Column(db.String(5))
+    chair_id = db.Column(db.Integer, db.ForeignKey('chair.id'))
+    tip = db.Column(db.String(10), nullable=False, default='VIP')  # <-- Yeni alan!
+
 class Appointment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    reference_number = db.Column(db.String(50), unique=True, nullable=False)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    emekli_no = db.Column(db.String(20), nullable=False)
+    name = db.Column(db.String(100), nullable=False)
     chair_id = db.Column(db.Integer, db.ForeignKey('chair.id'), nullable=False)
     date = db.Column(db.String(10), nullable=False)
     time = db.Column(db.String(5), nullable=False)
-    device_id = db.Column(db.String(100), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     chair = db.relationship('Chair')
 
-@login_manager.user_loader
-def load_user(user_id):
-    return User.query.get(int(user_id))
+ADMIN_USER = 'admin'
+ADMIN_PASS = '12345'
 
-@app.template_filter('date_tr')
-def date_tr(s):
-    # yyyy-mm-dd veya dd.mm.yyyy
-    if '-' in s:
-        y, m, d = s.split('-')
-        return f"{d}.{m}.{y}"
-    return s
-
-def generate_reference_number():
-    today_str = datetime.now().strftime("%Y%m%d")
-    count = Appointment.query.filter_by(
-        date=(datetime.now()+timedelta(days=1)).strftime("%d.%m.%Y")
-    ).count()
-    return f"{today_str}-{count+1:03d}"
-
-# Varsayılan saatleri otomatik ekle
-def setup_default_timeslots():
-    default_times = [
-        '08:00','08:30','09:00','09:30','10:00','10:30','11:00','11:30',
-        # 12:00, 12:30, 13:00 YOK
-        '13:30','14:00','14:30','15:00','15:30','16:00','16:30'
-    ]
-    if Timeslot.query.count() == 0:
-        for t in default_times:
-            db.session.add(Timeslot(time=t))
-        db.session.commit()
-
-# Varsayılan koltuk ekle (en az 1 tane)
-def setup_default_chairs():
+TURKCE_GUNLER = ['Pazartesi','Salı','Çarşamba','Perşembe','Cuma','Cumartesi','Pazar']
+@app.template_filter('todatetime')
+def todatetime_filter(s):
+    return datetime.strptime(s, "%d.%m.%Y")
+def gun_ismi(dt):
+    return TURKCE_GUNLER[dt.weekday()]
+def randevu_alabilir_mi():
+    simdi = datetime.now().time()
+    return dtime(9, 0) <= simdi < dtime(17, 0)
+def setup_defaults():
     if Chair.query.count() == 0:
         db.session.add(Chair(name="Koltuk 1"))
         db.session.add(Chair(name="Koltuk 2"))
-        db.session.commit()
-
-@app.route('/get_times/<int:chair_id>')
-@login_required
-def get_times(chair_id):
-    tomorrow_dt = datetime.now() + timedelta(days=1)
-    date_display = tomorrow_dt.strftime("%d.%m.%Y")
-    all_times = [ts.time for ts in Timeslot.query.order_by(Timeslot.time).all()]
-    taken_times = [
-        a.time for a in Appointment.query.filter_by(date=date_display, chair_id=chair_id).all()
-    ]
-    free_times = []
-    for t in all_times:
-        free_times.append({
-            "time": t,
-            "is_taken": t in taken_times
-        })
-    return jsonify(free_times)
-
-# Kayıt
-@app.route('/register', methods=['GET','POST'])
-def register():
-    if request.method=='POST':
-        username = request.form['username']
-        name = request.form['name']
-        pw = bcrypt.generate_password_hash(request.form['password']).decode()
-        if User.query.filter_by(username=username).first():
-            flash("Bu kullanıcı adı zaten alınmış.", "danger")
-            return redirect(url_for('register'))
-        user=User(username=username, name=name, password=pw)
-        db.create_all()
-        db.session.add(user)
-        db.session.commit()
-        return redirect(url_for('login'))
-    return render_template('user_register.html')
+    if Timeslot.query.count() == 0:
+        saatler = ['08:00','08:30','09:00','09:30','10:00','10:30','11:00','11:30',
+                   '13:30','14:00','14:30','15:00','15:30','16:00','16:30']
+        for s in saatler:
+            db.session.add(Timeslot(time=s))
+    db.session.commit()
 
 
-# Giriş
 
-@app.route('/login', methods=['GET','POST'])
-def login():
-    if request.method=='POST':
-        user = User.query.filter_by(username=request.form['username']).first()
-        if user and bcrypt.check_password_hash(user.password, request.form['password']):
-            login_user(user)
-            return redirect(url_for('user_panel'))
-        else:
-            flash("Geçersiz kullanıcı adı veya şifre!", "danger")
-    return render_template('user_login.html')
-
-
-# Çıkış
-@app.route('/logout')
-@login_required
-def logout():
-    logout_user()
-    return redirect(url_for('login'))
-
-# Kullanıcı panel & rezervasyon
-@app.route('/', methods=['GET','POST'])
-@login_required
+### -------------- KULLANICI PANELİ --------------
+@app.route('/dolu_saatler')
+def dolu_saatler():
+    koltuk_id = request.args.get('koltuk_id')
+    tarih = request.args.get('tarih')
+    dolu_randevular = Appointment.query.filter_by(chair_id=koltuk_id, date=tarih).all()
+    dolu_saatler = [r.time for r in dolu_randevular]
+    return jsonify(dolu_saatler)
+@app.route('/', methods=['GET', 'POST'])
 def user_panel():
-
-    tomorrow_dt = datetime.now() + timedelta(days=1)
-    date_display = tomorrow_dt.strftime("%d.%m.%Y")
-    date_db = date_display
-    now = datetime.now()
-    acilis = dtime(9,0)
-    kapanis = dtime(17,0)
-    randevu_aktif = (now.time() >= acilis and now.time() < kapanis)
-
-    if request.method == 'POST' and not randevu_aktif:
-        flash("Randevu alma hizmeti 09:00-17:00 arasında açıktır.", "danger")
-        return redirect(url_for('user_panel'))
-    device_id = request.cookies.get('device_id') or str(uuid.uuid4())
+    randevu_aktif = randevu_alabilir_mi()
     chairs = Chair.query.all()
     timeslots = [ts.time for ts in Timeslot.query.order_by(Timeslot.time).all()]
-    if request.method == 'POST':
-        selected_chair = int(request.form.get('chair_id', chairs[0].id))
+    tomorrow_dt = datetime.now() + timedelta(days=1)
+    date_display = tomorrow_dt.strftime("%d.%m.%Y")
+    gun = gun_ismi(tomorrow_dt)
+    now = datetime.now()
+    randevu_aktif = (now.time() >= dtime(9, 0)) and (now.time() < dtime(17, 0))
+
+    # --- Koltuk seçimi:
+    if request.method == "POST" and "chair_id" in request.form and "refresh" in request.form:
+        secili_koltuk_id = int(request.form["chair_id"])
+    elif request.method == "POST" and "chair_id" in request.form:
+        secili_koltuk_id = int(request.form["chair_id"])
     else:
-        selected_chair = chairs[0].id
+        secili_koltuk_id = chairs[0].id if chairs else None
 
-    taken_times = [
-        a.time for a in Appointment.query.filter_by(date=date_db, chair_id=selected_chair).all()
-    ]
+    # VIP Saatler (günü ve koltuğu kapsayan)
+    vips = VipTimeslot.query.filter_by(day_of_week=gun).all()
+    vip_saatler = set((v.time, v.chair_id) for v in vips if v.tip == "VIP")
+    izinli_saatler = set((v.time, v.chair_id) for v in vips if v.tip == "İzinli")
 
-    cooldown = False
-    remaining = None
-    last = Appointment.query.filter_by(device_id=device_id).order_by(Appointment.created_at.desc()).first()
-    if last:
-        delta = datetime.utcnow() - last.created_at
-        if delta.days < 14:
-            cooldown = True
-            rem = timedelta(days=14) - delta
-            d = rem.days
-            h, r = divmod(rem.seconds, 3600)
-            m = r // 60
-            remaining = f"{d} gün {h} saat {m} dakika"
+    # Koltuk-bazlı dolu saatler
+    dolu_saatler = {c.id: [] for c in chairs}
+    appts = Appointment.query.filter_by(date=date_display).all()
+    for a in appts:
+        dolu_saatler[a.chair_id].append(a.time)
 
-    if request.method == 'POST' and not cooldown:
-        time = request.form['time']
-        chair_id = selected_chair
-        if time in taken_times:
-            flash("Bu saat artık müsait değil.", "danger")
+    emekli_no = request.form.get('emekli_no', '')
+    aranan_name = ''
+    kalan_gun = 0
+    if emekli_no:
+        person = Person.query.filter_by(emekli_no=emekli_no).first()
+        if person:
+            aranan_name = person.name
+            son_randevu = Appointment.query.filter_by(emekli_no=emekli_no).order_by(Appointment.created_at.desc()).first()
+            if son_randevu:
+                son_tarih = son_randevu.created_at.date()
+                bugun = datetime.today().date()
+                fark = (bugun - son_tarih).days
+                if fark < 14:
+                    kalan_gun = 14 - fark
+                    flash (f"{kalan_gun} gün sonra tekrar randevu alabilirsiniz!","danger")
+        else:
+            flash("Kullanıcı bulunamadı!", "danger")
+        
+            
+
+            
+
+    # Randevu alma işlemi (refresh butonuna basılmadıysa)
+    if request.method == 'POST' and 'randevu_al'  in request.form:
+        emekli_no = request.form.get('emekli_no')
+        chair_id = int(request.form.get('chair_id'))
+        time_ = request.form.get('time')
+        person = Person.query.filter_by(emekli_no=emekli_no).first()
+        if not person:
+            flash("Kullanıcı bulunamadı! Randevu alınamaz.", "danger")
+            return render_template('user_panel.html')
+        # 14 gün kontrolü
+        son = Appointment.query.filter_by(emekli_no=emekli_no).order_by(Appointment.created_at.desc()).first()
+        if son and (son.created_at + timedelta(days=14) > datetime.now()):
+            diff = (son.created_at + timedelta(days=14)) - datetime.now()
+            flash(f"{diff.days+1} gün sonra tekrar randevu alabilirsiniz!", "danger")
             return redirect(url_for('user_panel'))
-        ref = generate_reference_number()
+        # Koltuk/saat dolu kontrolü
+        if time_ in dolu_saatler[chair_id]:
+            flash("Bu koltuk ve saat dolu!", "danger")
+            return redirect(url_for('user_panel'))
+        # VIP saat kontrolü
+        if (time_, chair_id) in vip_saatler:
+            flash("Bu saat VIP olarak ayrılmıştır, admin izni gerektirir!", "danger")
+            return redirect(url_for('user_panel'))
+        if (time_, chair_id) in izinli_saatler:
+            flash("Bu saat VIP olarak ayrılmıştır, admin izni gerektirir!", "danger")
+            return redirect(url_for('user_panel'))
         appt = Appointment(
-            reference_number=ref,
-            user_id=current_user.id,
+            emekli_no=emekli_no,
+            name=person.name,
             chair_id=chair_id,
-            date=date_db,
-            time=time,
-            device_id=device_id
+            date=date_display,
+            time=time_
         )
         db.session.add(appt)
         db.session.commit()
-        flash(f"Randevu alındı. Numaranız: {ref}", "success")
-        resp = redirect(url_for('user_panel'))
-        resp.set_cookie('device_id', device_id, max_age=31536000)
-        return resp
-
-    return render_template(
-        'user_panel.html',
-        date=date_display,
+        flash("Randevu başarıyla alındı.", "success")
+        return redirect(url_for('user_panel') + f"?emekli_no={emekli_no}")
+    
+    return render_template('user_panel.html',
         chairs=chairs,
-        selected_chair=selected_chair,
-        all_times=timeslots,
-        taken_times=taken_times,
-        cooldown=cooldown,
-        remaining=remaining,
+        timeslots=timeslots,
+        date=date_display,
+        gun=gun,
         randevu_aktif=randevu_aktif,
+        dolu_saatler=dolu_saatler,
+        vip_saatler=vip_saatler,
+        izinli_saatler=izinli_saatler,
+        emekli_no=emekli_no,
+        aranan_name=aranan_name,
+        kalan_gun=kalan_gun,
+        secili_koltuk_id=secili_koltuk_id,
+     
     )
 
-# Admin giriş
+@app.route('/api/person/<emekli_no>')
+def api_person(emekli_no):
+    person = Person.query.filter_by(emekli_no=emekli_no).first()
+    if person:
+        # Kalan gün bilgisi
+        son = Appointment.query.filter_by(emekli_no=emekli_no).order_by(Appointment.created_at.desc()).first()
+        kalan_gun = 0
+        if son:
+            diff = (son.created_at + timedelta(days=14)) - datetime.now()
+            kalan_gun = diff.days if diff.days > 0 else 0
+        return {"success": True, "name": person.name, "kalan_gun": kalan_gun}
+    else:
+        return {"success": False}
+
+### -------------- RANDEVULARIM --------------
+from datetime import datetime
+
+@app.route('/randevularim')
+def randevularim():
+    emekli_no = request.args.get('emekli_no')
+    if not emekli_no:
+        flash("Lütfen önce emekli sandığı numaranızla arama yapınız.", "danger")
+        return redirect(url_for('user_panel'))
+    randevular = Appointment.query.filter_by(emekli_no=emekli_no).order_by(Appointment.date.desc(), Appointment.time).all()
+    current_date = datetime.now().strftime('%d.%m.%Y')
+    return render_template('randevularim.html',
+                           randevular=randevular,
+                           emekli_no=emekli_no,
+                           current_date=current_date)
+
+
+@app.route('/iptal/<int:id>', methods=['POST'])
+def randevu_iptal(id):
+    appt = Appointment.query.get_or_404(id)
+    db.session.delete(appt)
+    db.session.commit()
+    flash("Randevu başarıyla iptal edildi.", "success")
+      # Admin panelinden geldiyse admin_panel'e, kullanıcıdan geldiyse randevularim'e dönebiliriz
+    ref = request.referrer
+    if ref and "admin" in ref:
+        return redirect(url_for('admin_panel'))
+    return redirect(url_for('randevularim', emekli_no=appt.emekli_no))
+
+### -------------- ADMIN LOGIN --------------
+@app.route('/admin/personel_list', methods=['GET', 'POST'])
+def admin_personel_list():
+
+    if not session.get('admin'): return redirect(url_for('admin'))
+    if request.method == 'POST':
+        emekli_no = request.form['emekli_no'].strip()
+        name = request.form['name'].strip()
+        if emekli_no and name and not Person.query.filter_by(emekli_no=emekli_no).first():
+            db.session.add(Person(emekli_no=emekli_no, name=name))
+            db.session.commit()
+            flash("Personel eklendi.", "success")
+    personeller = Person.query.order_by(Person.name).all()
+    return render_template('admin_personel_list.html', personeller=personeller)
+
+@app.route('/admin/personel_sil/<int:id>', methods=['POST'])
+def admin_personel_sil(id):
+    if not session.get('admin'): return redirect(url_for('admin'))
+    person = Person.query.get_or_404(id)
+    db.session.delete(person)
+    db.session.commit()
+    flash("Kişi silindi.", "success")
+    return redirect(url_for('admin_personel_list'))
+
+@app.route('/admin/personel_duzenle/<int:id>', methods=['POST'])
+def admin_personel_duzenle(id):
+    if not session.get('admin'): return redirect(url_for('admin'))
+    person = Person.query.get_or_404(id)
+    name = request.form['name'].strip()
+    person.name = name
+    db.session.commit()
+    flash("Kişi güncellendi.", "success")
+    return redirect(url_for('admin_personel_list'))
+
+@app.route('/admin/personel_import', methods=['GET', 'POST'])
+def admin_personel_import():
+    if not session.get('admin'): return redirect(url_for('admin'))
+    if request.method == 'POST':
+        file = request.files['file']
+        tumunu_sil = bool(request.form.get('tumunu_sil'))
+        df = pd.read_excel(file)
+        if tumunu_sil:
+            Person.query.delete()
+            db.session.commit()
+        count = 0
+        for _, row in df.iterrows():
+            emekli_no = str(row['EmekliNo']).strip()
+            name = str(row['AdSoyad']).strip()
+            if emekli_no and name and not Person.query.filter_by(emekli_no=emekli_no).first():
+                db.session.add(Person(emekli_no=emekli_no, name=name))
+                count += 1
+        db.session.commit()
+        flash(f"{count} personel eklendi.", "success")
+    return render_template('admin_personel_import.html')
+
 @app.route('/admin', methods=['GET','POST'])
-def admin_login():
-    if request.method=='POST':
-        if request.form['username']==app.config['ADMIN_USER'] and \
-           request.form['password']==app.config['ADMIN_PASS']:
-            session['admin']=True
+def admin():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        admin = Admin.query.filter_by(username=username).first()
+        if admin and admin.check_password(password):
+            session['admin'] = True
             return redirect(url_for('admin_panel'))
         else:
-            flash("Geçersiz admin bilgisi!", "danger")
+            flash('Kullanıcı adı veya şifre yanlış!', 'danger')
     return render_template('admin_login.html')
 
-@app.route('/admin/pdf_export')
-def admin_pdf_export():
-    if not session.get('admin'): return redirect(url_for('admin_login'))
-    date_filter = request.args.get('date', '')
-    if not date_filter:
-        flash("PDF almak için tarih seçiniz!", "danger")
-        return redirect(url_for('admin_panel'))
-    # YYYY-MM-DD -> GG.AA.YYYY dönüşüm
-    try:
-        dt = datetime.strptime(date_filter, "%Y-%m-%d")
-        date_filter_tr = dt.strftime("%d.%m.%Y")
-    except Exception:
-        date_filter_tr = date_filter
-    appointments = Appointment.query.filter_by(date=date_filter_tr).order_by(Appointment.time).all()
+### -------------- ADMIN PANEL --------------
+@app.route('/admin/logout')
+def admin_logout():
+    session.pop('admin', None)  # Eğer session ile admin login tutuluyorsa
+    return redirect(url_for('admin'))  # Giriş ekranı route'unu kullan
+@app.route('/admin/settings', methods=['GET', 'POST'])
+def admin_settings():
+    admin = Admin.query.first()
+    if request.method == 'POST':
+        old_username = request.form['current_username']
+        old_password = request.form['current_password']
+        new_username = request.form['new_username']
+        new_password = request.form['new_password']
+        new_password2 = request.form['new_password2']
 
-    # PDF oluştur
-    buffer = BytesIO()
-    p = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
-    p.setFont("Helvetica-Bold", 18)
-    p.drawCentredString(width/2, height-50, f"{date_filter} Randevu Listesi")
-    p.setFont("arial", 12)
-    y = height-80
-    p.drawString(40, y, "Saat               Koltuk                 İsim                        Ref No")
-    y -= 15
-    p.line(38, y, width-38, y)
-    y -= 20
+        if old_username != admin.username or not admin.check_password(old_password):
+            flash("Mevcut kullanıcı adı ya da şifre yanlış!", "danger")
+        elif new_password != new_password2:
+            flash("Yeni şifreler uyuşmuyor!", "danger")
+        else:
+            admin.username = new_username
+            admin.set_password(new_password)
+            db.session.commit()
+            flash("Kullanıcı adı ve şifre başarıyla güncellendi.", "success")
+            return redirect(url_for('admin_settings'))
+    return render_template('admin_settings.html')
 
-    for a in appointments:
-        p.drawString(40, y, f"{a.time:6}  {a.chair.name:8}  {a.user.name[:20]:20}  {a.reference_number}")
-        y -= 18
-        if y < 60:
-            p.showPage()
-            y = height-80
 
-    p.save()
-    buffer.seek(0)
-    filename = f"randevular_{date_filter}.pdf"
-    return send_file(buffer, as_attachment=True, download_name=filename, mimetype='application/pdf')
 
-# Admin panel
-@app.route('/admin_panel', methods=['GET', 'POST'])
+@app.route('/admin_panel')
 def admin_panel():
-    if not session.get('admin'): return redirect(url_for('admin_login'))
+    
+    current_date = datetime.now().strftime('%d.%m.%Y')
+    if not session.get('admin'):
+        return redirect(url_for('admin'))
 
-    # Tarih filtresi (YYYY-MM-DD gelir, GG.AA.YYYY'ye çevir)
-    date_filter = request.args.get('date', '')
+    date_filter = request.args.get('date')
+    appointments = Appointment.query
+
     if date_filter:
-        try:
-            # HTML'den YYYY-MM-DD geliyor, GG.AA.YYYY yap
-            dt = datetime.strptime(date_filter, "%Y-%m-%d")
-            date_filter_tr = dt.strftime("%d.%m.%Y")
-        except Exception:
-            date_filter_tr = date_filter
-        appointments = Appointment.query.filter_by(date=date_filter_tr).order_by(Appointment.time).all()
+        appointments = appointments.filter_by(date=date_filter)
+        appointments = appointments.order_by(Appointment.date, Appointment.time).all()
     else:
-        appointments = Appointment.query.order_by(Appointment.date, Appointment.time).all()
-        date_filter_tr = ''
-    return render_template('admin_panel.html', appointments=appointments, date_filter=date_filter_tr)
-# Koltuk yönetimi
+        appointments = appointments.order_by(Appointment.date, Appointment.time).all()
+
+    return render_template(
+        'admin_panel.html',
+        appointments=appointments,
+        date_filter=date_filter,
+        current_date=current_date
+    )
+
+
+
+@app.route('/admin/pdf_randevular')
+def admin_pdf_randevular():
+    if not session.get('admin'):
+        return redirect(url_for('admin'))
+
+    tarih = request.args.get('date')
+    if not tarih:
+        return "Tarih parametresi eksik!", 400
+
+    appts = Appointment.query.filter_by(date=tarih).all()
+     # Sıralama:
+    appts = sorted(appts, key=lambda r: datetime.strptime(r.time, "%H:%M"))
+    if not appts:
+        return f"<h3>{tarih} tarihinde randevu bulunamadı.</h3>", 200
+
+    df = pd.DataFrame([
+        {'Saat': a.time, 'Ad Soyad': a.name, 'Koltuk': a.chair.name}
+        for a in appts
+    ])
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.add_font('DejaVu', '', 'DejaVuSans.ttf', uni=True)
+    pdf.set_font('DejaVu', '', 13)
+    pdf.set_text_color(0, 0, 0)
+
+    pdf.cell(0, 12, f'{tarih} Randevuları', 0, 1, 'C')
+    pdf.set_font('DejaVu', '', 11)
+    pdf.cell(30, 8, "Saat", 1, 0, 'C')
+    pdf.cell(80, 8, "Ad Soyad", 1, 0, 'C')
+    pdf.cell(40, 8, "Koltuk", 1, 0, 'C')
+    pdf.cell(30, 8, "İmza", 1, 1, 'C')
+
+    for _, row in df.iterrows():
+        pdf.cell(30, 8, f"{row['Saat']}", 1, 0)
+        pdf.cell(80, 8, f"{row['Ad Soyad']}", 1, 0)
+        pdf.cell(40, 8, f"{row['Koltuk']}", 1, 0) 
+        pdf.cell(30, 8, "", 1, 1) 
+      
+    return Response(pdf.output(dest='S').encode('latin1'),
+        mimetype='application/pdf',
+        headers={"Content-Disposition": f"attachment;filename=randevular_{tarih}.pdf"})
+
+
+
+### -- ADMIN: KOLTUK EKLE/SİL --
 @app.route('/admin/chairs', methods=['GET','POST'])
 def admin_chairs():
-    if not session.get('admin'): return redirect(url_for('admin_login'))
-    if request.method=='POST':
-        if 'add' in request.form:
-            db.session.add(Chair(name=request.form['name']))
-            db.session.commit()
-        elif 'delete' in request.form:
-            Chair.query.filter_by(id=int(request.form['delete'])).delete()
-            db.session.commit()
-    return render_template('admin_chairs.html', chairs=Chair.query.all())
-
-# Saat yönetimi
-@app.route('/admin/timeslots', methods=['GET', 'POST'])
-def admin_timeslots():
-    if not session.get('admin'): return redirect(url_for('admin_login'))
+    if not session.get('admin'): return redirect(url_for('admin'))
     if request.method == 'POST':
-        if 'add' in request.form:
-            t = request.form['new_time'].strip()
-            if t and not Timeslot.query.filter_by(time=t).first():
-                db.session.add(Timeslot(time=t))
-                db.session.commit()
-        elif 'delete' in request.form:
-            Timeslot.query.filter_by(id=int(request.form['delete'])).delete()
+        if 'ekle' in request.form:
+            name = request.form['koltuk_adi'].strip()
+            if name:
+                db.session.add(Chair(name=name))
+        elif 'sil' in request.form:
+            chair_id = int(request.form['chair_id'])
+            Chair.query.filter_by(id=chair_id).delete()
+        db.session.commit()
+        return redirect(url_for('admin_chairs'))
+    chairs = Chair.query.all()
+    return render_template('admin_chairs.html', chairs=chairs)
+
+### -- ADMIN: SAAT EKLE/SİL --
+@app.route('/admin/timeslots', methods=['GET','POST'])
+def admin_timeslots():
+    if not session.get('admin'): return redirect(url_for('admin'))
+    if request.method == 'POST':
+        if 'ekle' in request.form:
+            saat = request.form['saat'].strip()
+            if saat:
+                db.session.add(Timeslot(time=saat))
+        elif 'sil' in request.form:
+            ts_id = int(request.form['ts_id'])
+            Timeslot.query.filter_by(id=ts_id).delete()
+        db.session.commit()
+        return redirect(url_for('admin_timeslots'))
+    timeslots = Timeslot.query.order_by(Timeslot.time).all()
+    return render_template('admin_timeslots.html', timeslots=timeslots)
+
+### -- ADMIN: VIP SAATLER YÖNET --
+@app.route('/admin/vip', methods=['GET','POST'])
+def admin_vip():
+    if not session.get('admin'): return redirect(url_for('admin'))
+    chairs = Chair.query.all()
+    timeslots = Timeslot.query.all()
+    if request.method == 'POST':
+        if 'ekle' in request.form:
+            day = request.form['day_of_week']
+            time = request.form['time']
+            chair_id = int(request.form['chair_id'])
+            tip = request.form.get('tip')
+            db.session.add(VipTimeslot(day_of_week=day, time=time, chair_id=chair_id,tip=tip))
             db.session.commit()
-    return render_template('admin_timeslots.html', timeslots=Timeslot.query.order_by(Timeslot.time).all())
+        elif 'sil' in request.form:
+            vip_id = int(request.form['vip_id'])
+            VipTimeslot.query.filter_by(id=vip_id).delete()
+            db.session.commit()
+        return redirect(url_for('admin_vip'))
+    vips = VipTimeslot.query.all()
+    return render_template('admin_vip.html', vips=vips, chairs=chairs, timeslots=timeslots, gunler=TURKCE_GUNLER)
 
-# Randevu sil
-@app.route('/delete/<int:id>')
-def delete(id):
-    if not session.get('admin'): return redirect(url_for('admin_login'))
-    a=Appointment.query.get_or_404(id)
-    db.session.delete(a)
-    db.session.commit()
-    return redirect(url_for('admin_panel'))
-
-# CSV export
-@app.route('/export_csv')
-def export_csv():
-    if not session.get('admin'): return redirect(url_for('admin_login'))
-    path='appointments.csv'
-    with open(path,'w',newline='', encoding='utf-8') as f:
-        w=csv.writer(f)
-        w.writerow(['Ref','User','Koltuk','Date','Time','Device','Created'])
-        for a in Appointment.query.all():
-            w.writerow([a.reference_number,a.user.name,a.chair.name,a.date,a.time,a.device_id,a.created_at])
-    return send_file(path,as_attachment=True)
-
-if __name__=='__main__':
+if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-        setup_default_chairs()
-        setup_default_timeslots()
-    app.run(host='172.16.10.4',port=5000, debug=True)
+        setup_defaults()
+        app.run(host="0.0.0.0", port=5000, debug=True)
+        
+     
